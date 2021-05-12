@@ -220,4 +220,6 @@ $RECYCLE.BIN/
 # End of https://www.toptal.com/developers/gitignore/api/python,windows,virtualenv,linux,visualstudiocode
 datasets/*
 !datasets/.gitkeep
+!datasets/*.py
 .vscode
+logs
