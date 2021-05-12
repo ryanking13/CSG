@@ -3,22 +3,27 @@ import pathlib
 from torch.utils.data import DataLoader
 from torchvision import datasets
 import torchvision.transforms as T
-import pytorch_lightning ad pl
+import pytorch_lightning as pl
 
-from .augmentations import TwoCropsTransform, RandAugment, augment_list
+from .augmentations import TwoCropsTransform, RandAugment
+
 
 class Transforms:
-    default = T.Compose([
-        T.Resize(224),
-        T.CenterCrop(224),
-        T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
+    default = T.Compose(
+        [
+            T.Resize(224),
+            T.CenterCrop(224),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
 
-    rand_augment = T.Compose([
-        RandAugment(1, 6., augment_list),
-        default,
-    ])
+    rand_augment = T.Compose(
+        [
+            RandAugment(1, 6.0),
+            default,
+        ]
+    )
 
     @classmethod
     def get_transform(cls, transform_type):
@@ -37,7 +42,7 @@ class VISDA17DataModule(pl.LightningDataModule):
         transforms="default",
         drop_last=True,
         siamese=True,
-    )
+    ):
         """
         Args:
             data_dir: visda17 dataset directory
@@ -53,17 +58,17 @@ class VISDA17DataModule(pl.LightningDataModule):
         self.drop_last = drop_last
 
         if isinstance(transforms, str):
-            self.train_trainsforms = Transforms.get_transform(transforms)
+            self.train_transforms = Transforms.get_transform(transforms)
         else:
             self.train_transforms = transforms
-        
+
         print(f"Using transforms: {transforms}")
 
         self.val_transforms = Transforms.default
 
         if self.siamese:
             self.train_transforms = TwoCropsTransform(self.train_transforms)
-        
+
     def setup(self, stage):
         self.trainset = datasets.ImageFolder(
             (self.data_dir / "train").as_posix(),
@@ -74,13 +79,13 @@ class VISDA17DataModule(pl.LightningDataModule):
             (self.data_dir / "validation").as_posix(),
             self.val_transforms,
         )
-    
+
     def train_dataloader(self):
         return DataLoader(
             self.trainset,
             batch_size=self.batch_size,
             shuffle=True,
-            num_workers=20,
+            num_workers=8,
             pin_memory=True,
             drop_last=self.drop_last,
         )
@@ -90,6 +95,6 @@ class VISDA17DataModule(pl.LightningDataModule):
             self.valset,
             batch_size=self.batch_size,
             shuffle=False,
-            num_workers=20,
+            num_workers=8,
             pin_memory=True,
         )

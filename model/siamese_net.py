@@ -1,6 +1,5 @@
 """Adapted from MoCo implementation of PytorchLightning/lightning-bolts"""
 
-from argparse import ArgumentParser
 from typing import Union, List, Tuple
 
 import torch
@@ -26,7 +25,7 @@ class SiameseNet(pl.LightningModule):
         batch_size: int = 32,
         stages: Union[List, Tuple] = (3, 4),
         lambda_nce: float = 0.1,
-        use_nce: bool = True,
+        siamese: bool = True,
         flip_on_validation: bool = True,
         apool: bool = True,
         *args,
@@ -39,7 +38,7 @@ class SiameseNet(pl.LightningModule):
             num_negatives: queue size; number of negative keys
             encoder_momentum: moco momentum of updating key encoder
             softmax_temperature: softmax temperature for NCE-loss
-            learning_rage: the learning rate
+            learning_rate: the learning rate
             momentum: optimizer momentum
             weight_decay: optimizer weight decay
             batch_size: batch size
@@ -52,20 +51,20 @@ class SiameseNet(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
-        self.encoder_q, self.encoder_k = self._init_encoders(base_encoder)
+        self.encoder_q, self.encoder_k = self._init_encoders(self.hparams.base_encoder)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
 
         # hack: brute-force replacement
         dim_fc = self.encoder_q.fc.weight.shape[1]
         self.encoder_q.fc = nn.Sequential(
-            nn.Linear(dim_fc, dim_fc),
+            nn.Linear(dim_fc, 512),
             nn.ReLU(),
-            nn.Linear(dim_fc, self.hparams.num_classes),
+            nn.Linear(512, self.hparams.num_classes),
         )
         self.encoder_k.fc = nn.Sequential(
-            nn.Linear(dim_fc, dim_fc),
+            nn.Linear(dim_fc, 512),
             nn.ReLU(),
-            nn.Linear(dim_fc, self.hparams.num_classes),
+            nn.Linear(512, self.hparams.num_classes),
         )
 
         # add mlp layer for contrastive loss
@@ -80,70 +79,81 @@ class SiameseNet(pl.LightningModule):
                 dim_mlp = block.conv2.weight.shape[0]
             else:
                 raise NotImplementedError(f"{type(block)} not supported.")
-            
+
             mlp_q[f"mlp_{stage}"] = nn.Sequential(
                 nn.Linear(dim_mlp, dim_mlp),
                 nn.ReLU(),
-                nn.Linear(dim_mlp, self.hparams_emb_dim),
+                nn.Linear(dim_mlp, self.hparams.emb_dim),
             )
             mlp_k[f"mlp_{stage}"] = nn.Sequential(
                 nn.Linear(dim_mlp, dim_mlp),
                 nn.ReLU(),
-                nn.Linear(dim_mlp, self.hparams_emb_dim),
+                nn.Linear(dim_mlp, self.hparams.emb_dim),
             )
-        
+
         self.encoder_q.mlp = nn.ModuleDict(mlp_q)
         self.encoder_k.mlp = nn.ModuleDict(mlp_k)
 
-        for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
-            param_k.data.coipy_(param_q.data) # initialize
-            param_k.requires_grad = False # not update by gradient
-        
+        for param_q, param_k in zip(
+            self.encoder_q.parameters(), self.encoder_k.parameters()
+        ):
+            param_k.data.copy_(param_q.data)  # initialize
+            param_k.requires_grad = False  # not update by gradient
+
         # create the queue
         for stage in self.hparams.stages:
-            self.register_buffer(f"queue_{stage}", torch.randn(self.hparams.emb_dim, self.hparams.num_negatives))
+            self.register_buffer(
+                f"queue_{stage}",
+                torch.randn(self.hparams.emb_dim, self.hparams.num_negatives),
+            )
             self.register_buffer(f"queue_ptr_{stage}", torch.zeros(1, dtype=torch.long))
-            setattr(self, f"queue_{stage}", nn.functional.normalize(getattr(self, f"queue_{stage}"), dim=0))
+            setattr(
+                self,
+                f"queue_{stage}",
+                nn.functional.normalize(getattr(self, f"queue_{stage}"), dim=0),
+            )
 
-    def _init_encoders(self, baes_encoder):
+    def _init_encoders(self, base_encoder):
         encoder_q = base_encoder(pretrained=True)
         encoder_k = base_encoder(pretrained=True)
 
         return encoder_q, encoder_k
-    
+
     @torch.no_grad()
     def _momentum_update_key_encoder(self):
         """
         Momentum update of the key encoder
         """
         # only update mlp, freeze feature extractor
-        for param_q, param_k in zip(self.encoder_q.mlp.parameters(), self.encoder_k.mlp.parameters()):
+        for param_q, param_k in zip(
+            self.encoder_q.mlp.parameters(), self.encoder_k.mlp.parameters()
+        ):
             em = self.hparams.encoder_momentum
-            param_k.data = param_k.data * em + param_q.data * (1. - em)
-    
+            param_k.data = param_k.data * em + param_q.data * (1.0 - em)
+
     @torch.no_grad()
     def _dequeue_and_enqueue(self, keys, stage):
         # gather keys before updating queue
         if self.trainer.use_ddp or self.trainer.use_ddp2:
             keys = concat_all_gather(keys)
-        
+
         queue = getattr(self, f"queue_{stage}")
         queue_ptr = getattr(self, f"queue_ptr_{stage}")
 
         self._dequeue_and_euqueue_stage(keys, queue, queue_ptr)
-    
+
     @torch.no_grad()
-    def _dequeue_and_euqueue_stage(self, keys, queue_queue_ptr):
+    def _dequeue_and_euqueue_stage(self, keys, queue, queue_ptr):
         batch_size = keys.shape[0]
 
         ptr = int(queue_ptr)
-        assert self.hparams.num_negataives % batch_size = 0 # for simplicity
+        assert self.hparams.num_negatives % batch_size == 0  # for simplicity
 
         # replace the keys at ptr (dequeue and enqueue)
-        self.queue[:, ptr:ptr + batch_size] = keys.T
+        queue[:, ptr : ptr + batch_size] = keys.T
         ptr = (ptr + batch_size) % self.hparams.num_negatives  # move pointer
 
-        self.queue_ptr[0] = ptr
+        queue_ptr[0] = ptr
 
     @torch.no_grad()
     def _batch_shuffle_ddp(self, x):  # pragma: no cover
@@ -194,13 +204,13 @@ class SiameseNet(pl.LightningModule):
 
     def forward(self, img_q, img_k):
         y_pred, features_q = self.encoder_q(img_q)
-        self._momentum_update_key_encoder() # update the key encoder
+        self._momentum_update_key_encoder()  # update the key encoder
 
         logits_all = []
         labels_all = []
 
         # compute key features
-        with torch.no_grad(): # no gradient to keys
+        with torch.no_grad():  # no gradient to keys
             # shuffle for making use of BN
             if self.trainer.use_ddp or self.trainer.use_ddp2:
                 img_k, idx_unshuffle = self._batch_shuffle_ddp(img_k)
@@ -208,13 +218,13 @@ class SiameseNet(pl.LightningModule):
             _, features_k = self.encoder_k(img_k)
             if self.hparams.apool:
                 _, features_k_on_q = self.encoder_q(img_k)
-            
+
         for idx, stage in enumerate(self.hparams.stages):
             if self.hparams.apool:
                 q = self.adaptive_pool(features_q[stage], features_q[stage])
             else:
                 q = self.avgpool(features_q[stage])
-            
+
             q = torch.flatten(q, 1)
             q = self.encoder_q.mlp[f"mlp_{stage}"](q)
             q = nn.functional.normalize(q, dim=1)
@@ -224,11 +234,11 @@ class SiameseNet(pl.LightningModule):
                     k = self.adaptive_pool(features_k[stage], features_k_on_q[stage])
                 else:
                     k = self.avgpool(features_k[stage])
-                
+
                 # undo shuffle
                 if self.trainer.use_ddp or self.trainer.use_ddp2:
                     k = self._batch_unshuffle_ddp(k, idx_unshuffle)
-                
+
                 k = torch.flatten(k, 1)
                 k = self.encoder_k.mlp[f"mlp_{stage}"](k)
                 k = nn.functional.normalize(k, dim=1)
@@ -236,9 +246,11 @@ class SiameseNet(pl.LightningModule):
             # compute logits
             # Einstein sum is more intuitive
             # positive logits: Nx1
-            l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1)
+            l_pos = torch.einsum("nc,nc->n", [q, k]).unsqueeze(-1)
             # negative logits: NxK
-            l_neg = torch.einsum('nc,ck->nk', [q, getattr(self, f"queue_{stage}").clone().detach()])
+            l_neg = torch.einsum(
+                "nc,ck->nk", [q, getattr(self, f"queue_{stage}").clone().detach()]
+            )
 
             # logits: Nx(1+K)
             logits = torch.cat([l_pos, l_neg], dim=1)
@@ -254,7 +266,7 @@ class SiameseNet(pl.LightningModule):
             labels_all.append(labels)
 
             # dequeue and enqueue
-            self._dequeue_and_enqueue(k)
+            self._dequeue_and_enqueue(k, stage)
 
         return y_pred, logits_all, labels_all
 
@@ -264,49 +276,54 @@ class SiameseNet(pl.LightningModule):
         #       Further analysis required.
         self.eval()
 
-        (img_1, img_2), lebels = batch
+        (img_1, img_2), labels = batch
 
         y_pred, output, target = self(img_q=img_1, img_k=img_2)
         loss_class = F.cross_entropy(y_pred, labels.long())
-        loss_nce = sum([F.cross_entropy(o.float(), t.long()) for o, t in zip(output, target)])
+        loss_nce = sum(
+            [F.cross_entropy(o.float(), t.long()) for o, t in zip(output, target)]
+        )
 
         loss = loss_class
-        if self.hparams.use_nce:
+        if self.hparams.siamese:
             loss += self.hparams.lambda_nce * loss_nce
-        
+
         acc1, acc5 = precision_at_k(y_pred, labels, top_k=(1, 5))
 
-        log = {"train_loss": loss, "train_acc1", acc1, "train_acc5": acc5}
+        log = {"train_loss": loss, "train_acc1": acc1, "train_acc5": acc5}
         self.log_dict(log, sync_dist=True)
         return loss
-    
+
     def validation_step(self, batch, batch_idx):
         img, labels = batch
-        y_pred , _ = self.encoder_q(img)
+        y_pred, _ = self.encoder_q(img)
 
         if self.hparams.flip_on_validation:
-            y_pred_flip, _ = self.encoder_q(torch.flip(img, dips=(3,)))
+            y_pred_flip, _ = self.encoder_q(torch.flip(img, dims=(3,)))
             y_pred = (y_pred + y_pred_flip) / 2
-        
+
         loss = F.cross_entropy(y_pred, labels.long())
 
         acc1, acc5 = precision_at_k(y_pred, labels, top_k=(1, 5))
 
         results = {"val_loss": loss, "val_acc1": acc1, "val_acc5": acc5}
-        return results, (y_pred, labels)
-    
+        return results
+
     def validation_epoch_end(self, results):
-        outputs = [r[0] for r in results]
-        predictions = [r[1] for r in results]
+        val_loss = mean(results, "val_loss")
+        val_acc1 = mean(results, "val_acc1")
+        val_acc5 = mean(results, "val_acc5")
 
-        val_loss = mean(outputs, "val_loss")
-        val_acc1 = mean(outputs, "val_acc1")
-        val_acc5 = mean(outputs, "val_acc5")
-
-        log = {"val_loss": val_loss, "val_acc1": acc1, "val_acc5": acc5}
+        log = {"val_loss": val_loss, "val_acc1": val_acc1, "val_acc5": val_acc5}
         self.log_dict(log, sync_dist=True)
-        self.print("[Epoch {self.current_epoch}]: [Val loss: {val_loss} / Val acc1: {val_acc1} / Val acc5: {val_acc5}]")
-    
+        try:
+            # LightningModule.print() has an issue on printing when validation mode
+            self.print(
+                f"[Epoch {self.current_epoch}]: [Val loss: {val_loss} / Val acc1: {val_acc1} / Val acc5: {val_acc5}]"
+            )
+        except:
+            pass
+
     def adaptive_pool(self, features, attention_base):
         assert features.shape == attention_base.shape
 
@@ -316,16 +333,16 @@ class SiameseNet(pl.LightningModule):
         attention /= torch.einsum("nhw->n", [attention]).view(batch_size, 1, 1)
         features_with_attention = torch.einsum("nchw,nhw->nchw", [features, attention])
         return torch.einsum("nchw->nc", [features_with_attention])
-    
+
     def configure_optimizers(self):
         optimizer = torch.optim.SGD(
             self.parameters(),
             self.hparams.learning_rate,
             momentum=self.hparams.momentum,
-            weight_decay=self.hparams.weight_decay
+            weight_decay=self.hparams.weight_decay,
         )
         return optimizer
-    
+
 
 @torch.no_grad()
 def concat_all_gather(tensor):
@@ -333,7 +350,9 @@ def concat_all_gather(tensor):
     Performs all_gather operation on the provided tensors.
     *** Warning ***: torch.distributed.all_gather has no gradient.
     """
-    tensors_gather = [torch.ones_like(tensor) for _ in range(torch.distributed.get_world_size())]
+    tensors_gather = [
+        torch.ones_like(tensor) for _ in range(torch.distributed.get_world_size())
+    ]
     torch.distributed.all_gather(tensors_gather, tensor, async_op=False)
 
     output = torch.cat(tensors_gather, dim=0)
