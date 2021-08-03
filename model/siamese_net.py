@@ -1,5 +1,5 @@
 """Adapted from MoCo implementation of PytorchLightning/lightning-bolts"""
-
+``
 from typing import Union, List, Tuple
 
 import torch
@@ -7,66 +7,84 @@ from torch import nn
 from torch.nn import functional as F
 import pytorch_lightning as pl
 from pl_bolts.metrics import mean, precision_at_k
+from torchmetrics import IoU
 
 from .resnet import BasicBlock, Bottleneck
-
+from .deeplab import ASPP
 
 class SiameseNet(pl.LightningModule):
     def __init__(
         self,
         base_encoder: Union[str, torch.nn.Module] = "resnet101",
+        num_classes: int = 12,
         emb_dim: int = 128,
-        num_negatives: int = 65536,
-        encoder_momentum: float = 0.999,
-        softmax_temperature: float = 0.07,
+        emb_depth: int = 1,
+        fc_dim: int = 512,
+        num_patches: int = 1,
         learning_rate: float = 0.1,
         momentum: float = 0.9,
         weight_decay: float = 5e-4,
         batch_size: int = 32,
         stages: Union[List, Tuple] = (3, 4),
-        lambda_nce: float = 0.1,
         siamese: bool = True,
-        flip_on_validation: bool = True,
+        flip_on_validation: bool = False,
         apool: bool = True,
+        contrastive_loss = None,
         *args,
         **kwargs,
     ):
         """
         Args:
             base_encoder: base network which consists siamese network
-            emb_dim: feature dimension which will be used for calculating NCE-loss
-            num_negatives: queue size; number of negative keys
-            encoder_momentum: moco momentum of updating key encoder
-            softmax_temperature: softmax temperature for NCE-loss
+            num_classes: # of classes
+            emb_dim: projector dimension which will be used for calculating contrastive loss
+            emb_depth: projector depth
             learning_rate: the learning rate
             momentum: optimizer momentum
             weight_decay: optimizer weight decay
             batch_size: batch size
-            stages: base encoder (resnet) stages to calculate NCE-loss
-            lambda_nce: weight of NCE-loss
-            use_nce: use NCE-loss for training, if false, it is equivalent to training a single netowork
+            stages: base encoder (resnet) stages to calculate contrastive loss
+            siamese: whether or not to use contrastive loss
             flip_on_validation: on validation, use the mean classification result of two flipped image
             apool: use attentional pooling instead of GAP
+            contrastive_loss: contrastive loss function to use
         """
         super().__init__()
         self.save_hyperparameters()
 
-        self.encoder_q, self.encoder_k = self._init_encoders(self.hparams.base_encoder)
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        assert (
+            not self.hparams.siamese or self.hparams.contrastive_loss is not None
+        ), f"Contrastive loss must be specified when using siamese network"
 
+        self.contrastive_loss = contrastive_loss(ddp=True) if contrastive_loss is not None else None
+
+        # create encoders
+        self.encoder_q, self.encoder_k = self._init_encoders(self.hparams.base_encoder, self.hparams.num_classes)
+
+        self._override_classifier()
+        self._attach_projector()
+    
+    def _override_classifier(self):
         # hack: brute-force replacement
-        dim_fc = self.encoder_q.fc.weight.shape[1]
+
+        # Note: this method assumes that base encoder IS Pytorch ResNet (OR it has 'fc' layer)
+        #       if you want to use other encoder, you must override this method
+        classifier_layer = self.encoder_q.fc
+        dim_fc = classifier_layer.weight.shape[1]
+        dim_head = self.hparams.fc_dim
+        
         self.encoder_q.fc = nn.Sequential(
-            nn.Linear(dim_fc, 512),
+            nn.Linear(dim_fc, dim_head),
             nn.ReLU(),
-            nn.Linear(512, self.hparams.num_classes),
+            nn.Linear(dim_head, self.hparams.num_classes),
         )
         self.encoder_k.fc = nn.Sequential(
-            nn.Linear(dim_fc, 512),
+            nn.Linear(dim_fc, dim_head),
             nn.ReLU(),
-            nn.Linear(512, self.hparams.num_classes),
+            nn.Linear(dim_head, self.hparams.num_classes),
         )
-
+    
+    def _attach_projector(self):
         # add mlp layer for contrastive loss
         mlp_q = {}
         mlp_k = {}
@@ -80,19 +98,27 @@ class SiameseNet(pl.LightningModule):
             else:
                 raise NotImplementedError(f"{type(block)} not supported.")
 
+            emb_q = []
+            emb_k = []
+            for _ in range(self.hparams.emb_depth):
+                emb_q.append(nn.Linear(dim_mlp, dim_mlp))
+                emb_q.append(nn.ReLU())
+                emb_k.append(nn.Linear(dim_mlp, dim_mlp))
+                emb_k.append(nn.ReLU())
+            
+            emb_q.append(nn.Lienar(dim_mlp, self.hparams.emb_dim))
+            emb_k.append(nn.Lienar(dim_mlp, self.hparams.emb_dim))
+
             mlp_q[f"mlp_{stage}"] = nn.Sequential(
-                nn.Linear(dim_mlp, dim_mlp),
-                nn.ReLU(),
-                nn.Linear(dim_mlp, self.hparams.emb_dim),
+                *emb_q,
             )
             mlp_k[f"mlp_{stage}"] = nn.Sequential(
-                nn.Linear(dim_mlp, dim_mlp),
-                nn.ReLU(),
-                nn.Linear(dim_mlp, self.hparams.emb_dim),
+                *emb_k,
             )
 
         self.encoder_q.mlp = nn.ModuleDict(mlp_q)
         self.encoder_k.mlp = nn.ModuleDict(mlp_k)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
 
         for param_q, param_k in zip(
             self.encoder_q.parameters(), self.encoder_k.parameters()
@@ -100,60 +126,11 @@ class SiameseNet(pl.LightningModule):
             param_k.data.copy_(param_q.data)  # initialize
             param_k.requires_grad = False  # not update by gradient
 
-        # create the queue
-        for stage in self.hparams.stages:
-            self.register_buffer(
-                f"queue_{stage}",
-                torch.randn(self.hparams.emb_dim, self.hparams.num_negatives),
-            )
-            self.register_buffer(f"queue_ptr_{stage}", torch.zeros(1, dtype=torch.long))
-            setattr(
-                self,
-                f"queue_{stage}",
-                nn.functional.normalize(getattr(self, f"queue_{stage}"), dim=0),
-            )
-
-    def _init_encoders(self, base_encoder):
-        encoder_q = base_encoder(pretrained=True)
-        encoder_k = base_encoder(pretrained=True)
+    def _init_encoders(self, base_encoder, num_classes):
+        encoder_q = base_encoder(pretrained=True, num_classes=num_classes)
+        encoder_k = base_encoder(pretrained=True, num_classes=num_classes)
 
         return encoder_q, encoder_k
-
-    @torch.no_grad()
-    def _momentum_update_key_encoder(self):
-        """
-        Momentum update of the key encoder
-        """
-        # only update mlp, freeze feature extractor
-        for param_q, param_k in zip(
-            self.encoder_q.mlp.parameters(), self.encoder_k.mlp.parameters()
-        ):
-            em = self.hparams.encoder_momentum
-            param_k.data = param_k.data * em + param_q.data * (1.0 - em)
-
-    @torch.no_grad()
-    def _dequeue_and_enqueue(self, keys, stage):
-        # gather keys before updating queue
-        if self.trainer.use_ddp or self.trainer.use_ddp2:
-            keys = concat_all_gather(keys)
-
-        queue = getattr(self, f"queue_{stage}")
-        queue_ptr = getattr(self, f"queue_ptr_{stage}")
-
-        self._dequeue_and_euqueue_stage(keys, queue, queue_ptr)
-
-    @torch.no_grad()
-    def _dequeue_and_euqueue_stage(self, keys, queue, queue_ptr):
-        batch_size = keys.shape[0]
-
-        ptr = int(queue_ptr)
-        assert self.hparams.num_negatives % batch_size == 0  # for simplicity
-
-        # replace the keys at ptr (dequeue and enqueue)
-        queue[:, ptr : ptr + batch_size] = keys.T
-        ptr = (ptr + batch_size) % self.hparams.num_negatives  # move pointer
-
-        queue_ptr[0] = ptr
 
     @torch.no_grad()
     def _batch_shuffle_ddp(self, x):  # pragma: no cover
@@ -204,22 +181,26 @@ class SiameseNet(pl.LightningModule):
 
     def forward(self, img_q, img_k):
         y_pred, features_q = self.encoder_q(img_q)
-        self._momentum_update_key_encoder()  # update the key encoder
+        self.contrastive_loss.on_forward(
+            encoder_q=self.encoder_q,
+            encoder_k=self.encoder_k,
+        )
 
-        logits_all = []
-        labels_all = []
+        features = []
 
         # compute key features
         with torch.no_grad():  # no gradient to keys
             # shuffle for making use of BN
-            if self.trainer.use_ddp or self.trainer.use_ddp2:
-                img_k, idx_unshuffle = self._batch_shuffle_ddp(img_k)
+            # When chunking is enabled, shuffle doesn't work
+            # if self.trainer.use_ddp or self.trainer.use_ddp2:
+            #     img_k, idx_unshuffle = self._batch_shuffle_ddp(img_k)
 
             _, features_k = self.encoder_k(img_k)
             if self.hparams.apool:
                 _, features_k_on_q = self.encoder_q(img_k)
 
         for idx, stage in enumerate(self.hparams.stages):
+            features_q[stage] = self.chunk_feature(features_q[stage], self.hparams.num_patches) 
             if self.hparams.apool:
                 q = self.adaptive_pool(features_q[stage], features_q[stage])
             else:
@@ -230,68 +211,58 @@ class SiameseNet(pl.LightningModule):
             q = nn.functional.normalize(q, dim=1)
 
             with torch.no_grad():
+                features_k[stage] = self.chunk_feature(features_k[stage], self.hparams.num_patches)
+                features_k_on_q[stage] = self.chunk_feature(features_k_on_q[stage], self.hparams.num_patches)
                 if self.hparams.apool:
                     k = self.adaptive_pool(features_k[stage], features_k_on_q[stage])
                 else:
                     k = self.avgpool(features_k[stage])
 
                 # undo shuffle
-                if self.trainer.use_ddp or self.trainer.use_ddp2:
-                    k = self._batch_unshuffle_ddp(k, idx_unshuffle)
+                # When chunking is enabled, shuffle doesn't work
+                # if self.trainer.use_ddp or self.trainer.use_ddp2:
+                #     k = self._batch_unshuffle_ddp(k, idx_unshuffle)
 
                 k = torch.flatten(k, 1)
                 k = self.encoder_k.mlp[f"mlp_{stage}"](k)
                 k = nn.functional.normalize(k, dim=1)
 
-            # compute logits
-            # Einstein sum is more intuitive
-            # positive logits: Nx1
-            l_pos = torch.einsum("nc,nc->n", [q, k]).unsqueeze(-1)
-            # negative logits: NxK
-            l_neg = torch.einsum(
-                "nc,ck->nk", [q, getattr(self, f"queue_{stage}").clone().detach()]
-            )
+            features.append({
+                "q": q,
+                "k": k,
+                "stage": stage,
+            })
 
-            # logits: Nx(1+K)
-            logits = torch.cat([l_pos, l_neg], dim=1)
-
-            # apply temperature
-            logits /= self.hparams.softmax_temperature
-
-            # labels: positive key indicators
-            labels = torch.zeros(logits.shape[0], dtype=torch.long)
-            labels = labels.type_as(logits)
-
-            logits_all.append(logits)
-            labels_all.append(labels)
-
-            # dequeue and enqueue
-            self._dequeue_and_enqueue(k, stage)
-
-        return y_pred, logits_all, labels_all
+        return y_pred, features
 
     def training_step(self, batch, batch_idx):
-        # Note: setting eval mode in training step is important for performance,
-        #       which freezes batchnorm weights to pretrained weights.
-        #       Further analysis required.
-        self.eval()
+        # Freeze batchnorm layers
+        self.apply(set_bn_eval)
 
         (img_1, img_2), labels = batch
 
-        y_pred, output, target = self(img_q=img_1, img_k=img_2)
-        loss_class = F.cross_entropy(y_pred, labels.long())
-        loss_nce = sum(
-            [F.cross_entropy(o.float(), t.long()) for o, t in zip(output, target)]
-        )
+        y_pred, features = self(img_q=img_1, img_k=img_2)
 
-        loss = loss_class
+        loss_class = F.cross_entropy(y_pred, labels.long())
+        loss_contrastive = 0.0
+
         if self.hparams.siamese:
-            loss += self.hparams.lambda_nce * loss_nce
+            loss_contrastive = sum([
+                self.contrastive_loss(f["q"], f["k"], stage=f["stage"] for f in features
+            ])
 
         acc1, acc5 = precision_at_k(y_pred, labels, top_k=(1, 5))
 
-        log = {"train_loss": loss, "train_acc1": acc1, "train_acc5": acc5}
+        loss = loss_class + loss_contrastive
+        log = {
+            "train_loss": loss,
+            "train_loss_class": loss_class,
+            "train_loss_contrastive", loss_contrastive,
+            "train_acc1": acc1,
+            "train_acc5": acc5
+        }
         self.log_dict(log, sync_dist=True)
+
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -319,7 +290,7 @@ class SiameseNet(pl.LightningModule):
         try:
             # LightningModule.print() has an issue on printing when validation mode
             self.print(
-                f"[Epoch {self.current_epoch}]: [Val loss: {val_loss} / Val acc1: {val_acc1} / Val acc5: {val_acc5}]"
+                f"[Epoch {self.current_epoch}]: [Val loss: {val_loss:.3f} / Val acc1: {val_acc1:.3f} / Val acc5: {val_acc5:.3f}]"
             )
         except:
             pass
@@ -333,6 +304,19 @@ class SiameseNet(pl.LightningModule):
         attention /= torch.einsum("nhw->n", [attention]).view(batch_size, 1, 1)
         features_with_attention = torch.einsum("nchw,nhw->nchw", [features, attention])
         return torch.einsum("nchw->nc", [features_with_attention])
+    
+    def chunk_feature(self, feature, num_chunks):
+        if num_chunks == 1:
+            return feature
+        
+        chunks = torch.chunk(feature, num_chunks, dim=2)
+        chunks = [torch.chunk(c, num_chunks, dim=3) for c in chunks]
+
+        chunked_feature = []
+        for c in chunks:
+            chunked_feature += c
+        
+        return torch.cat(chunked_feature, dim=0)
 
     def configure_optimizers(self):
         optimizer = torch.optim.SGD(
@@ -343,6 +327,91 @@ class SiameseNet(pl.LightningModule):
         )
         return optimizer
 
+
+class SiameseNetSegmentation(SiameseNet):
+    def __init__(
+        self,
+        base_encoder,
+        num_classes=12,
+        emb_dim=128,
+        emb_depth=1,
+        learning_rate=0.1,
+        momentum=0.9,
+        weight_decay=5e-4,
+        batch_size=32,
+        stages=(3, 4),
+        flip_on_validation=False,
+        fc_dim=512,
+        num_patches=8,
+        apool=True,
+        contrastive_loss=None,
+        *args,
+        **kwargs,
+    ):
+        super().__init__(base_encoder, num_classes, emb_dim, emb_depth, learning_rate, momentum,
+                        weight_decay, batch_size, stages, flip_on_validation, fc_dim, num_patches, apool, contrastive_loss,
+                        *args, **kwargs)
+        
+        self.iou = IoU(num_classes=self.hparams.num_classes, ignore_index=255)
+        self.criterion = nn.CrossEntropyLoss(ignore_index=255, reduction="mean")
+    
+    def _override_classifier(self):
+        self.encoder_q.aspp = ASPP(2048, self.hparams.num_classes, [6, 12, 18, 24])
+        self.encoder_k.aspp = ASPP(2048, self.hparams.num_classes, [6, 12, 18, 24])
+    
+    def training_step(self, batch, batch_idx):
+        self.apply(set_bn_eval)
+
+        (img_1, img_2), labels = batch
+        y_pred, features = self(img_q=img_1, img_k=img_2)
+
+        loss_class = self.criterion(y_pred, labels.long())
+        loss_contrastive = 0.0
+
+        if self.hparams.siamese:
+            loss_contrastive = sum([
+                self.contrastive_loss(f["q"], f["k"], stage=f["stage"] for f in features
+            ])
+
+        loss = loss_class + loss_contrastive
+        log = {
+            "train_loss": loss,
+            "train_loss_class": loss_class,
+            "train_loss_contrastive", loss_contrastive,
+            "train_acc1": acc1,
+            "train_acc5": acc5
+        }
+        self.log_dict(log, sync_dist=True)
+
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        img, labels = batch
+        y_pred, _ = self.encoder_q(img)
+
+        loss = self.criterion(y_pred, labels.long())
+
+        self.iou(y_pred.argmax(dim=1), labels)
+
+        results = {"val_loss": loss}
+        return results
+
+    def validation_epoch_end(self, results):
+
+        val_loss = mean(results, "val_loss")
+
+        val_iou = self.iou.compute()
+        self.iou.reset()
+
+        log = {"val_loss": val_loss, "val_iou": val_iou}
+        self.log_dict(log, sync_dist=True)
+        try:
+            # LightningModule.print() has an issue on printing when validation mode
+            self.print(
+                f"[Epoch {self.current_epoch}]: [Val loss: {val_loss:.3f} / Val mIoU: {val_iou:.3f}]"
+            )
+        except:
+            pass
 
 @torch.no_grad()
 def concat_all_gather(tensor):
@@ -357,3 +426,8 @@ def concat_all_gather(tensor):
 
     output = torch.cat(tensors_gather, dim=0)
     return output
+
+
+def set_bn_eval(module):
+    if isinstance(module, (nn.BatchNorm2d, nn.GroupNorm)):
+        module.eval()
