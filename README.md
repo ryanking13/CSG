@@ -73,7 +73,7 @@ python run.py --eval-only --resume https://github.com/ryanking13/CSG/releases/do
 | Model            | Accuracy |
 | ---------------- | -------- |
 | CSG (from paper) | 64.1     |
-| CSG (reimpl)     | 66.1     |
+| CSG (reimpl)     | 67.1     |
 
 ## Semantic Segmentation
 
