@@ -1,5 +1,4 @@
 """Adapted from MoCo implementation of PytorchLightning/lightning-bolts"""
-``
 from typing import Union, List, Tuple
 
 import torch
@@ -7,10 +6,14 @@ from torch import nn
 from torch.nn import functional as F
 import pytorch_lightning as pl
 from pl_bolts.metrics import mean, precision_at_k
-from torchmetrics import IoU
+
+# from torchmetrics import IoU
 
 from .resnet import BasicBlock, Bottleneck
 from .deeplab import ASPP
+from .metrics.iou import IoU
+from .utils.scheduler import WarmupConstantSchedule
+
 
 class SiameseNet(pl.LightningModule):
     def __init__(
@@ -29,7 +32,8 @@ class SiameseNet(pl.LightningModule):
         siamese: bool = True,
         flip_on_validation: bool = False,
         apool: bool = True,
-        contrastive_loss = None,
+        warmup_iters: int = 1,
+        contrastive_loss=None,
         *args,
         **kwargs,
     ):
@@ -50,20 +54,19 @@ class SiameseNet(pl.LightningModule):
             contrastive_loss: contrastive loss function to use
         """
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore="contrastive_loss")
+        self.contrastive_loss = contrastive_loss
 
         assert (
-            not self.hparams.siamese or self.hparams.contrastive_loss is not None
+            not self.hparams.siamese or self.contrastive_loss is not None
         ), f"Contrastive loss must be specified when using siamese network"
 
-        self.contrastive_loss = contrastive_loss(ddp=True) if contrastive_loss is not None else None
-
         # create encoders
-        self.encoder_q, self.encoder_k = self._init_encoders(self.hparams.base_encoder, self.hparams.num_classes)
+        self.encoder_q, self.encoder_k = self._init_encoders(self.hparams.base_encoder)
 
         self._override_classifier()
         self._attach_projector()
-    
+
     def _override_classifier(self):
         # hack: brute-force replacement
 
@@ -72,7 +75,7 @@ class SiameseNet(pl.LightningModule):
         classifier_layer = self.encoder_q.fc
         dim_fc = classifier_layer.weight.shape[1]
         dim_head = self.hparams.fc_dim
-        
+
         self.encoder_q.fc = nn.Sequential(
             nn.Linear(dim_fc, dim_head),
             nn.ReLU(),
@@ -83,7 +86,7 @@ class SiameseNet(pl.LightningModule):
             nn.ReLU(),
             nn.Linear(dim_head, self.hparams.num_classes),
         )
-    
+
     def _attach_projector(self):
         # add mlp layer for contrastive loss
         mlp_q = {}
@@ -105,9 +108,9 @@ class SiameseNet(pl.LightningModule):
                 emb_q.append(nn.ReLU())
                 emb_k.append(nn.Linear(dim_mlp, dim_mlp))
                 emb_k.append(nn.ReLU())
-            
-            emb_q.append(nn.Lienar(dim_mlp, self.hparams.emb_dim))
-            emb_k.append(nn.Lienar(dim_mlp, self.hparams.emb_dim))
+
+            emb_q.append(nn.Linear(dim_mlp, self.hparams.emb_dim))
+            emb_k.append(nn.Linear(dim_mlp, self.hparams.emb_dim))
 
             mlp_q[f"mlp_{stage}"] = nn.Sequential(
                 *emb_q,
@@ -126,9 +129,9 @@ class SiameseNet(pl.LightningModule):
             param_k.data.copy_(param_q.data)  # initialize
             param_k.requires_grad = False  # not update by gradient
 
-    def _init_encoders(self, base_encoder, num_classes):
-        encoder_q = base_encoder(pretrained=True, num_classes=num_classes)
-        encoder_k = base_encoder(pretrained=True, num_classes=num_classes)
+    def _init_encoders(self, base_encoder):
+        encoder_q = base_encoder(pretrained=True)
+        encoder_k = base_encoder(pretrained=True)
 
         return encoder_q, encoder_k
 
@@ -200,7 +203,9 @@ class SiameseNet(pl.LightningModule):
                 _, features_k_on_q = self.encoder_q(img_k)
 
         for idx, stage in enumerate(self.hparams.stages):
-            features_q[stage] = self.chunk_feature(features_q[stage], self.hparams.num_patches) 
+            features_q[stage] = self.chunk_feature(
+                features_q[stage], self.hparams.num_patches
+            )
             if self.hparams.apool:
                 q = self.adaptive_pool(features_q[stage], features_q[stage])
             else:
@@ -211,8 +216,12 @@ class SiameseNet(pl.LightningModule):
             q = nn.functional.normalize(q, dim=1)
 
             with torch.no_grad():
-                features_k[stage] = self.chunk_feature(features_k[stage], self.hparams.num_patches)
-                features_k_on_q[stage] = self.chunk_feature(features_k_on_q[stage], self.hparams.num_patches)
+                features_k[stage] = self.chunk_feature(
+                    features_k[stage], self.hparams.num_patches
+                )
+                features_k_on_q[stage] = self.chunk_feature(
+                    features_k_on_q[stage], self.hparams.num_patches
+                )
                 if self.hparams.apool:
                     k = self.adaptive_pool(features_k[stage], features_k_on_q[stage])
                 else:
@@ -227,11 +236,13 @@ class SiameseNet(pl.LightningModule):
                 k = self.encoder_k.mlp[f"mlp_{stage}"](k)
                 k = nn.functional.normalize(k, dim=1)
 
-            features.append({
-                "q": q,
-                "k": k,
-                "stage": stage,
-            })
+            features.append(
+                {
+                    "q": q,
+                    "k": k,
+                    "stage": stage,
+                }
+            )
 
         return y_pred, features
 
@@ -247,9 +258,12 @@ class SiameseNet(pl.LightningModule):
         loss_contrastive = 0.0
 
         if self.hparams.siamese:
-            loss_contrastive = sum([
-                self.contrastive_loss(f["q"], f["k"], stage=f["stage"] for f in features
-            ])
+            loss_contrastive = sum(
+                [
+                    self.contrastive_loss(f["q"], f["k"], stage=f["stage"])
+                    for f in features
+                ]
+            )
 
         acc1, acc5 = precision_at_k(y_pred, labels, top_k=(1, 5))
 
@@ -257,9 +271,9 @@ class SiameseNet(pl.LightningModule):
         log = {
             "train_loss": loss,
             "train_loss_class": loss_class,
-            "train_loss_contrastive", loss_contrastive,
+            "train_loss_contrastive": loss_contrastive,
             "train_acc1": acc1,
-            "train_acc5": acc5
+            "train_acc5": acc5,
         }
         self.log_dict(log, sync_dist=True)
 
@@ -304,18 +318,18 @@ class SiameseNet(pl.LightningModule):
         attention /= torch.einsum("nhw->n", [attention]).view(batch_size, 1, 1)
         features_with_attention = torch.einsum("nchw,nhw->nchw", [features, attention])
         return torch.einsum("nchw->nc", [features_with_attention])
-    
+
     def chunk_feature(self, feature, num_chunks):
         if num_chunks == 1:
             return feature
-        
+
         chunks = torch.chunk(feature, num_chunks, dim=2)
         chunks = [torch.chunk(c, num_chunks, dim=3) for c in chunks]
 
         chunked_feature = []
         for c in chunks:
             chunked_feature += c
-        
+
         return torch.cat(chunked_feature, dim=0)
 
     def configure_optimizers(self):
@@ -325,7 +339,18 @@ class SiameseNet(pl.LightningModule):
             momentum=self.hparams.momentum,
             weight_decay=self.hparams.weight_decay,
         )
-        return optimizer
+        scheduler = WarmupConstantSchedule(
+            optimizer=optimizer,
+            warmup_steps=self.hparams.warmup_iters,
+        )
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+            },
+        }
 
 
 class SiameseNetSegmentation(SiameseNet):
@@ -335,30 +360,49 @@ class SiameseNetSegmentation(SiameseNet):
         num_classes=12,
         emb_dim=128,
         emb_depth=1,
+        fc_dim=512,
+        num_patches=8,
         learning_rate=0.1,
         momentum=0.9,
         weight_decay=5e-4,
         batch_size=32,
         stages=(3, 4),
+        siamese=True,
         flip_on_validation=False,
-        fc_dim=512,
-        num_patches=8,
         apool=True,
+        warmup_iters=500,
         contrastive_loss=None,
         *args,
         **kwargs,
     ):
-        super().__init__(base_encoder, num_classes, emb_dim, emb_depth, learning_rate, momentum,
-                        weight_decay, batch_size, stages, flip_on_validation, fc_dim, num_patches, apool, contrastive_loss,
-                        *args, **kwargs)
-        
-        self.iou = IoU(num_classes=self.hparams.num_classes, ignore_index=255)
+        super().__init__(
+            base_encoder=base_encoder,
+            num_classes=num_classes,
+            emb_dim=emb_dim,
+            emb_depth=emb_depth,
+            learning_rate=learning_rate,
+            momentum=momentum,
+            weight_decay=weight_decay,
+            batch_size=batch_size,
+            stages=stages,
+            siamese=siamese,
+            flip_on_validation=flip_on_validation,
+            fc_dim=fc_dim,
+            num_patches=num_patches,
+            apool=apool,
+            warmup_iters=500,
+            contrastive_loss=contrastive_loss,
+            *args,
+            **kwargs,
+        )
+
+        self.iou = IoU(num_classes=self.hparams.num_classes)
         self.criterion = nn.CrossEntropyLoss(ignore_index=255, reduction="mean")
-    
+
     def _override_classifier(self):
         self.encoder_q.aspp = ASPP(2048, self.hparams.num_classes, [6, 12, 18, 24])
         self.encoder_k.aspp = ASPP(2048, self.hparams.num_classes, [6, 12, 18, 24])
-    
+
     def training_step(self, batch, batch_idx):
         self.apply(set_bn_eval)
 
@@ -369,17 +413,18 @@ class SiameseNetSegmentation(SiameseNet):
         loss_contrastive = 0.0
 
         if self.hparams.siamese:
-            loss_contrastive = sum([
-                self.contrastive_loss(f["q"], f["k"], stage=f["stage"] for f in features
-            ])
+            loss_contrastive = sum(
+                [
+                    self.contrastive_loss(f["q"], f["k"], stage=f["stage"])
+                    for f in features
+                ]
+            )
 
         loss = loss_class + loss_contrastive
         log = {
             "train_loss": loss,
             "train_loss_class": loss_class,
-            "train_loss_contrastive", loss_contrastive,
-            "train_acc1": acc1,
-            "train_acc5": acc5
+            "train_loss_contrastive": loss_contrastive,
         }
         self.log_dict(log, sync_dist=True)
 
@@ -390,8 +435,7 @@ class SiameseNetSegmentation(SiameseNet):
         y_pred, _ = self.encoder_q(img)
 
         loss = self.criterion(y_pred, labels.long())
-
-        self.iou(y_pred.argmax(dim=1), labels)
+        self.iou(y_pred.argmax(dim=1), labels.long())
 
         results = {"val_loss": loss}
         return results
@@ -412,6 +456,7 @@ class SiameseNetSegmentation(SiameseNet):
             )
         except:
             pass
+
 
 @torch.no_grad()
 def concat_all_gather(tensor):

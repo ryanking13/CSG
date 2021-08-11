@@ -3,9 +3,19 @@ import torch
 from torch import nn
 from torch.random import initial_seed
 
-class MoCoLoss(nn.Module):
 
-    def __init__(self, embedding_dim, queue_size, momentum, temperature, scale_loss, queue_ids, *args, **kwargs):
+class MoCoLoss(nn.Module):
+    def __init__(
+        self,
+        embedding_dim,
+        queue_size,
+        momentum,
+        temperature,
+        scale_loss,
+        queue_ids,
+        *args,
+        **kwargs,
+    ):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.queue_size = queue_size
@@ -13,7 +23,7 @@ class MoCoLoss(nn.Module):
         self.temperature = temperature
         self.scale_loss = scale_loss
         self.queue_ids = queue_ids
-        self.ddp = kwargs.get("ddp", False)
+        self.ddp = True
         self.initialized = False
 
         for queue_id in queue_ids:
@@ -21,13 +31,15 @@ class MoCoLoss(nn.Module):
                 f"queue_{queue_id}",
                 torch.randn(self.embedding_dim, self.queue_size),
             )
-            self.register_buffer(f"queue_ptr_{queue_id}", torch.zeros(1, dtype=torch.long))
+            self.register_buffer(
+                f"queue_ptr_{queue_id}", torch.zeros(1, dtype=torch.long)
+            )
             setattr(
                 self,
                 f"queue_{queue_id}",
                 nn.functional.normalize(getattr(self, f"queue_{queue_id}"), dim=0),
             )
-        
+
         self.criterion = nn.CrossEntropyLoss()
 
     def on_forward(self, *args, **kwargs):
@@ -36,15 +48,15 @@ class MoCoLoss(nn.Module):
         self._momentum_update_key_encoder(encoder_q, encoder_k)
 
     @torch.no_grad()
-    def _momentum_update_key_encoder(self):
+    def _momentum_update_key_encoder(self, encoder_q, encoder_k):
         """
         Momentum update of the key encoder
         """
         # only update mlp, freeze feature extractor
         for param_q, param_k in zip(
-            self.encoder_q.mlp.parameters(), self.encoder_k.mlp.parameters()
+            encoder_q.mlp.parameters(), encoder_k.mlp.parameters()
         ):
-            em = self.hparams.encoder_momentum
+            em = self.momentum
             param_k.data = param_k.data * em + param_q.data * (1.0 - em)
 
     @torch.no_grad()
@@ -63,7 +75,7 @@ class MoCoLoss(nn.Module):
         batch_size = keys.shape[0]
 
         ptr = int(queue_ptr)
-        assert self.queue_size % batch_size == 0  # for simplicity
+        # assert self.queue_size % batch_size == 0  # for simplicity
 
         # replace the keys at ptr (dequeue and enqueue)
         queue[:, ptr : ptr + batch_size] = keys.T
@@ -73,10 +85,14 @@ class MoCoLoss(nn.Module):
 
     def forward(self, q, k, *args, **kwargs):
         if not self.initialized:
-            for queue_id  in self.queue_ids:
-                setattr(self, f"queue_{queue_id}", getattr(self, f"queue_{queue_id}".to(q.device))
+            for queue_id in self.queue_ids:
+                setattr(
+                    self,
+                    f"queue_{queue_id}",
+                    getattr(self, f"queue_{queue_id}").to(q.device),
+                )
             self.initialized = True
-        
+
         stage = kwargs["stage"]
 
         # compute logits
@@ -97,11 +113,12 @@ class MoCoLoss(nn.Module):
         # labels: positive key indicators
         labels = torch.zeros(logits.shape[0], dtype=torch.long)
         labels = labels.type_as(logits)
-        
+
         # dequeue and enqueue
         self._dequeue_and_enqueue(k, stage)
 
         return self.scale_loss * self.criterion(logits.float(), labels.long())
+
 
 # TODO: Remove duplicate
 @torch.no_grad()

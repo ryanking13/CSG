@@ -6,7 +6,11 @@ from torchvision import datasets
 import torchvision.transforms as T
 import pytorch_lightning as pl
 
-from .transforms import ClassificationTransforms, SegmentationTransforms, TwoCropsTransform
+from .transforms import (
+    ClassificationTransforms,
+    SegmentationTransforms,
+    TwoCropsTransform,
+)
 from .gta5 import GTA5
 from .cityscapes import Cityscapes
 
@@ -78,7 +82,6 @@ class VISDA17DataModule(pl.LightningDataModule):
 
 
 class GTA5toCityscapesDataModule(pl.LightningDataModule):
-
     def __init__(
         self,
         root_dir,
@@ -106,7 +109,7 @@ class GTA5toCityscapesDataModule(pl.LightningDataModule):
             self.train_transforms = SegmentationTransforms.get_transform(transforms)
         else:
             self.train_transforms = transforms
-        
+
         print(f"Using transforms: {self.train_transforms}")
 
         self.val_transforms = SegmentationTransforms.default
@@ -114,14 +117,16 @@ class GTA5toCityscapesDataModule(pl.LightningDataModule):
 
         if self.siamese:
             self.train_transforms = TwoCropsTransform(self.train_transforms)
-    
+
     def setup(self, stage):
         self.trainset = GTA5(
             root=self.train_dir.as_posix(),
             transform=self.train_transforms,
-            target_transform=T.Compose([
-                T.Lambda(lambda t: t.squeeze()),
-            ]),
+            target_transform=T.Compose(
+                [
+                    T.Lambda(_squeeze),
+                ]
+            ),
             joint_transforms=self.joint_transforms,
         )
         self.valset = Cityscapes(
@@ -130,10 +135,14 @@ class GTA5toCityscapesDataModule(pl.LightningDataModule):
             mode="fine",
             target_type="semantic",
             transform=self.val_transforms,
-            target_transform=T.Compose([
-                T.Lambda(lambda t: t.squeeze()),
-            ]),
+            target_transform=T.Compose(
+                [
+                    T.Lambda(_squeeze),
+                ]
+            ),
         )
+
+        # breakpoint()
 
     def train_dataloader(self):
         return DataLoader(
@@ -153,3 +162,9 @@ class GTA5toCityscapesDataModule(pl.LightningDataModule):
             num_workers=8,
             pin_memory=True,
         )
+
+
+def _squeeze(
+    t,
+):  # On windows, lambda function or local method is not pickleable, so we need to define it manually
+    return t.squeeze()

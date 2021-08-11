@@ -1,4 +1,8 @@
-from .transforms import ClassificationTransforms, SegmentationTransforms, TwoCropsTransform
+from .transforms import (
+    ClassificationTransforms,
+    SegmentationTransforms,
+    TwoCropsTransform,
+)
 
 __all__ = [
     "ClassificationTransforms",

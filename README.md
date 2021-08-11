@@ -13,18 +13,19 @@ Tested in a Python 3.8 environment in Linux and Windows with:
 - Pytorch: 1.8.1
 - [Pytorch Lightning](https://github.com/PyTorchLightning/pytorch-lightning): 1.3.1
 - [Lightning bolts](https://github.com/PyTorchLightning/lightning-bolts): 0.3.3
+- [Torchmetrics](https://github.com/PyTorchLightning/metrics): 0.3.2
 - 1x RTX 3070
   
-To install Pytorch Lightning and Lightning bolts,
+Installing the dependencies:
 
 ```sh
-pip install pytorch-lightning lightning-bolts
+pip install pytorch-lightning lightning-bolts torchmetrics
 ```
 
 ## Classification (VisDA17)
 ### Dataset Setup
 
-Download [VisDA17 dataset from here](https://github.com/VisionLearningGroup/taskcv-2017-public/tree/master/classification) or,
+Download [VisDA17 dataset from official website](https://github.com/VisionLearningGroup/taskcv-2017-public/tree/master/classification) or,
 use the provided script for your convenience.
 
 ```sh
@@ -47,70 +48,99 @@ If you downloaded the dataset manually, extract and place them as below.
 
 __Training__
 
-Simply run,
+Simply run:
 
-```
+```sh
 python run.py
 ```
 
 or with options,
 
 ```sh
-usage: run.py [-h] [-o OUTPUT] [-r ROOT] [-e EPOCHS] [-lr LEARNING_RATE] [-bs BATCH_SIZE] [-wd WEIGHT_DECAY]
-              [--momentum MOMENTUM] [--num-classes NUM_CLASSES] [--emb-dim EMB_DIM] [--single-network]
-              [--nce-weight NCE_WEIGHT] [--eval-only] [--num-gpus NUM_GPUS] [--resume RESUME] [--dev-run]
-              [--exp-name EXP_NAME] [--augmentation AUGMENTATION] [--seed SEED]
-
-optional arguments:
-  -h, --help            show this help message and exit
-  -o OUTPUT, --output OUTPUT
-                        Output directory where checkpoint and log will be saved (default: logs)
-  -r ROOT, --root ROOT  Root directory of the VisDA17 dataset (default: datasets\visda17)
-  -e EPOCHS, --epochs EPOCHS
-                        Number of epochs (default: 30)
-  -lr LEARNING_RATE, --learning-rate LEARNING_RATE
-                        Learning rate (default: 0.0001)
-  -bs BATCH_SIZE, --batch-size BATCH_SIZE
-                        Batch size (default: 32)
-  -wd WEIGHT_DECAY, --weight-decay WEIGHT_DECAY
-                        Weight decay (default: 0.0005)
-  --momentum MOMENTUM   Optimizer momentum (default: 0.9)
-  --num-classes NUM_CLASSES
-                        Number of classes (default: 12)
-  --emb-dim EMB_DIM     Feature dimension (default: 128)
-  --single-network      Train with single network, for comparison
-  --nce-weight NCE_WEIGHT
-                        Weight of nce loss (default: 0.1)
-  --eval-only           Do not train, evaluate model
-  --num-gpus NUM_GPUS   Number of gpus to use (default: All GPUs in the machine)
-  --resume RESUME       Resume from the given checkpoint
-  --dev-run             Run small steps to test whether model is valid
-  --exp-name EXP_NAME   Experiment name used for a log directory name
-  --augmentation AUGMENTATION
-                        Augmentations to use (default: rand_augment)
-  --seed SEED           Random seed (default: 0)
+usage: run.py [-h] [-o OUTPUT] [-r ROOT] [-e EPOCHS] [-lr LEARNING_RATE] [-bs BATCH_SIZE] [-wd WEIGHT_DECAY] [--task {classification,segmentation}] [--encoder {resnet101,deeplab50,deeplab101}] [--momentum MOMENTUM] [--num-classes NUM_CLASSES] [--eval-only] [--gpus GPUS]
+              [--resume RESUME] [--dev-run] [--exp-name EXP_NAME] [--augmentation AUGMENTATION] [--seed SEED] [--fc-dim FC_DIM] [--no-apool] [--single-network] [--stages STAGES [STAGES ...]] [--emb-dim EMB_DIM] [--emb-depth EMB_DEPTH] [--num-patches NUM_PATCHES]
+              [--moco-weight MOCO_WEIGHT] [--moco-queue-size MOCO_QUEUE_SIZE] [--moco-momentum MOCO_MOMENTUM] [--moco-temperature MOCO_TEMPERATURE]
 ```
 
 __Evaluation__
 
 ```
-python run.py --eval-only --resume https://github.com/ryanking13/CSG/releases/download/v0.1/csg_resnet101.ckpt
+python run.py --eval-only --resume https://github.com/ryanking13/CSG/releases/download/v0.2/csg_resnet101.ckpt
 ```
 
 ### Results
 
-| Model                                   | Accuracy |
-| --------------------------------------- | -------- |
-| CSG (from paper)                        | 64.1     |
-| CSG-lightning                           | 66.1     |
-
-__Differences from official implementation__
-
-- No LR scheduler
-- No layerwise LR modification
-- RandAugment augmentation types
-
+| Model            | Accuracy |
+| ---------------- | -------- |
+| CSG (from paper) | 64.1     |
+| CSG (reimpl)     | 66.1     |
 
 ## Semantic Segmentation
 
-Not supported yet.
+### Dataset Setup (GTA5 ==> Cityscapes)
+
+Download [GTA5](https://download.visinf.tu-darmstadt.de/data/from_games/) and [Cityscapes](https://www.cityscapes-dataset.com/downloads/) datasets.
+
+Place them as below.
+
+```
+📂 datasets
+ ┣ 📂 GTA5
+ ┃ ┣ 📂 images 
+ ┃ ┃ ┣ 📜 00001.png
+ ┃ ┃ ┣ ...
+ ┃ ┃ ┗ 📜 24966.png
+ ┃ ┃ ┣ 📂 labels
+ ┃ ┃ ┣ 📜 00001.png
+ ┃ ┃ ┣ ...
+ ┃ ┃ ┗ 📜 24966.png
+ ┣ 📂 cityscapes
+ ┃ ┣ 📂 leftImg8bit
+ ┃ ┃ ┣ 📂 train
+ ┃ ┃ ┃ 📂 val
+ ┗ ┗ ┗ 📂 test
+ ┃ ┣ 📂 gtFine 
+ ┃ ┃ ┣ 📂 train
+ ┃ ┃ ┃ 📂 val
+ ┗ ┗ ┗ 📂 test
+```
+
+### How to run
+
+__Training__
+
+Simply run:
+
+```sh
+./run_seg.sh
+```
+
+__Evaluation__
+
+```
+./run_seg --eval-only --resume https://github.com/ryanking13/CSG/releases/download/v0.2/csg_deeplab50.ckpt
+```
+
+### Results
+
+| Model            | IoU   |
+| ---------------- | ----- |
+| CSG (from paper) | 35.27 |
+| CSG (reimpl)     | 34.71 |
+
+## Differences from official implementation
+
+- Warmup LR scheduler
+- No layerwise LR modification
+- RandAugment augmentation types
+
+## Known Issues
+
+- I got error `Distributed package doesn't have NCCL built in` 
+
+On windows, `nccl` is not supported, try:
+
+```bat
+set PL_TORCH_DISTRIBUTED_BACKEND=gloo
+```
+

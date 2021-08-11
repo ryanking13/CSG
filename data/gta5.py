@@ -5,8 +5,11 @@ import numpy as np
 import torch
 from torchvision.datasets import Cityscapes as _Cityscapes
 
+
 class GTA5:
-    def __init__(self, root, transform=None, target_transform=None, joint_transforms=None):
+    def __init__(
+        self, root, transform=None, target_transform=None, joint_transforms=None
+    ):
         """
         GTA5 (Playing for data) dataset.
 
@@ -22,7 +25,7 @@ class GTA5:
         ┃ ┃ ...
         ┗ ┗ 📜 24966.png
         """
-        
+
         self.root = pathlib.Path(root)
         self.image_dir = self.root / "images"
         self.mask_dir = self.root / "labels"
@@ -34,12 +37,10 @@ class GTA5:
         self.joint_transforms = joint_transforms
 
         self.images = [img.as_posix() for img in self.imgs_path]
-        self.masks = [
-            (self.mask_dir / img.name).as_posix() for img in self.imgs_path
-        ]
+        self.masks = [(self.mask_dir / img.name).as_posix() for img in self.imgs_path]
 
         self.ignore_label = 255
-        self.color2trainid = [{}
+        self.color2trainid = {}
         for cityscapes_class in _Cityscapes.classes:
             if cityscapes_class.train_id in (-1, 255):
                 continue
@@ -53,15 +54,17 @@ class GTA5:
         mask = np.asarray(Image.open(mask_path).convert("RGB"))
 
         # Convert color mask to trainid mask compatible to cityscapes
-        mask_size = mask[:,:,0].shape
+        mask_size = mask[:, :, 0].shape
         mask_copy = np.full(mask_size, self.ignore_label, dtype=np.uint8)
 
-        for k, v in self.color_map.items():
+        for k, v in self.color2trainid.items():
             if v in (-1, 255):
                 continue
 
-            color_mask = (mask == np.array(k))
-            mask_copy[color_mask[:, :, 0] & color_mask[:, :, 1] & color_mask[:, :, 2]] = v
+            color_mask = mask == np.array(k)
+            mask_copy[
+                color_mask[:, :, 0] & color_mask[:, :, 1] & color_mask[:, :, 2]
+            ] = v
 
         mask = Image.fromarray(mask_copy.astype(np.uint8))
 
@@ -73,16 +76,16 @@ class GTA5:
         # Apply joint trainsforms to image/target
         if self.joint_transforms is not None:
             image, mask = self.joint_transforms(image, mask)
-        
+
         mask = torch.tensor(np.array(mask))
 
         if self.transform is not None:
             image = self.transform(image)
-        
+
         if self.target_transform is not None:
             mask = self.target_transform(mask)
-        
+
         return image, mask
-    
+
     def __len__(self):
         return len(self.images)

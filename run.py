@@ -61,7 +61,7 @@ def parse_args():
 
     parser.add_argument(
         "--task",
-        default="classfication",
+        default="classification",
         choices=["classification", "segmentation"],
         help="Task to run (default: %(default)s)",
     )
@@ -123,6 +123,14 @@ def parse_args():
         default=512,
         help="Dimension of FC hidden layer (default: %(default)s)",
     )
+    parser.add_argument(
+        "--no-apool",
+        dest="apool",
+        action="store_const",
+        default=True,
+        const=False,
+        help="Disable attentional pooling",
+    )
 
     parser.add_argument(
         "--single-network",
@@ -165,7 +173,7 @@ def parse_args():
     parser.add_argument(
         "--moco-queue-size",
         type=int,
-        default=2**16,
+        default=2 ** 16,
         help="Queue size of MoCo (default: %(default)s)",
     )
     parser.add_argument(
@@ -175,24 +183,23 @@ def parse_args():
         help="Encoder momentum of MoCo (default: %(default)s)",
     )
     parser.add_argument(
-        "--mono-temperature",
+        "--moco-temperature",
         type=float,
         default=0.07,
-        help="Temparature of MoCo (default: %(default)s)",
+        help="Temperature of MoCo (default: %(default)s)",
     )
 
     return parser.parse_args()
 
+
 def build_loss(hparams):
-    return lambda *args, **kwargs: ssl_loss.MoCoLoss(
+    return ssl_loss.MoCoLoss(
         embedding_dim=hparams.emb_dim,
         queue_size=hparams.moco_queue_size,
         momentum=hparams.moco_momentum,
         temperature=hparams.moco_temperature,
         scale_loss=hparams.moco_weight,
-        queue_ids=hparams.stage,
-        *args,
-        **kwargs,
+        queue_ids=hparams.stages,
     )
 
 
@@ -200,7 +207,7 @@ def main():
     args = parse_args()
     print("Args: ", args)
 
-    seed = random.ranint(0, 1e7) if args.seed == "random" else int(args.seed)
+    seed = random.randint(0, 1e7) if args.seed == "random" else int(args.seed)
     pl.seed_everything(seed)
 
     encoder = {
@@ -213,11 +220,13 @@ def main():
     if task == "classification":
         _model = SiameseNet
         _datamodule = VISDA17DataModule
+        monitor = "val_acc1"
     elif task == "segmentation":
         _model = SiameseNetSegmentation
         _datamodule = GTA5toCityscapesDataModule
+        monitor = "val_iou"
     else:
-        raise KeyError("Unknown task: {task}")
+        raise KeyError(f"Unknown task: {task}")
 
     model = _model(
         base_encoder=encoder,
@@ -231,8 +240,9 @@ def main():
         emb_dim=args.emb_dim,
         emb_depth=args.emb_depth,
         fc_dim=args.fc_dim,
+        apool=args.apool,
         num_patches=args.num_patches,
-        contrastive_loss=build_loss(),
+        contrastive_loss=build_loss(args),
     )
 
     datamodule = _datamodule(
@@ -252,7 +262,7 @@ def main():
         default_hp_metric=False,
     )
     checkpoint_monitor = ModelCheckpoint(
-        monitor="val_loss",
+        monitor=monitor,
         mode="max",
         dirpath=os.path.join(args.output, "tensorboard", exp_name + start_time),
         filename=exp_name + "_{epoch:02d}_{val_loss:.2f}_{val_acc1:.2f}",
@@ -260,7 +270,7 @@ def main():
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
 
     trainer = pl.Trainer(
-        gpus=args.num_gpus,
+        gpus=args.gpus,
         max_epochs=args.epochs,
         check_val_every_n_epoch=1,
         accelerator="ddp",
@@ -281,7 +291,9 @@ def main():
             print("You must specify --resume <checkpoint>")
             exit(1)
 
-        model = SiameseNet.load_from_checkpoint(args.resume)
+        model = _model.load_from_checkpoint(
+            args.resume, contrastive_loss=build_loss(args)
+        )
         datamodule.setup(stage="val")
         trainer.validate(model, val_dataloaders=datamodule.val_dataloader())
     else:

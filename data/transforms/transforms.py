@@ -3,6 +3,7 @@ import torchvision.transforms as T
 from . import joint_transforms
 from .rand_augment import RandAugment
 
+
 class Transforms:
     @classmethod
     def get_transform(cls, transform_type):
@@ -10,7 +11,8 @@ class Transforms:
             return getattr(cls, transform_type)
         except AttributeError:
             print(f"Invalid transform: {transform_type}, using default transform.")
-            return cls.default    
+            return cls.default
+
 
 class ClassificationTransforms(Transforms):
     default = T.Compose(
@@ -32,26 +34,32 @@ class ClassificationTransforms(Transforms):
 
 class SegmentationTransforms(Transforms):
 
-    default = T.Compose([
-        T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+    default = T.Compose(
+        [
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
 
-    joint_default = joint_transforms.Compose([
-        joint_transforms.RandomSizeAndCrop(
-            512,
-            crop_nopad=False,
-            scale_min=0.75,
-            scale_max=1.25,
-        ),
-        joint_transforms.Resize(512),
-        joint_transforms.RandomHorizontallyFlip(),
-    ])
+    joint_default = joint_transforms.Compose(
+        [
+            joint_transforms.RandomSizeAndCrop(
+                512,
+                crop_nopad=False,
+                scale_min=0.75,
+                scale_max=1.25,
+            ),
+            joint_transforms.Resize(512),
+            joint_transforms.RandomHorizontallyFlip(),
+        ]
+    )
 
-    color_jitter = T.Compose([
-        T.ColorJitter(0.4, 0.4, 0.4, 0.4),
-        default,
-    ])
+    color_jitter = T.Compose(
+        [
+            T.ColorJitter(0.4, 0.4, 0.4, 0.4),
+            default,
+        ]
+    )
 
 
 class TwoCropsTransform:
