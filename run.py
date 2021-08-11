@@ -2,24 +2,21 @@ import argparse
 import datetime
 import os
 import subprocess as sp
+import random
 
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.plugins import DDPPlugin
 
-from data.dataloader import VISDA17DataModule
-from model.siamese_net import SiameseNet
+from data.dataloader import VISDA17DataModule, GTA5toCityscapesDataModule
+from model.siamese_net import SiameseNet, SiameseNetSegmentation
 from model.resnet import resnet101
+from model.deeplab import deeplab101, deeplab50
+import loss as ssl_loss
 
 
 def parse_args():
-    try:
-        gpus_in_machine = len(
-            sp.check_output(["nvidia-smi", "-L"]).strip().split(b"\n")
-        )
-    except:
-        gpus_in_machine = 1
-
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "-o",
@@ -30,7 +27,7 @@ def parse_args():
     parser.add_argument(
         "-r",
         "--root",
-        default=os.path.join(os.environ.get("DATASETS", "datasets"), "visda17"),
+        default=os.path.join(os.environ.get("DATASETS", "datasets")),
         help="Root directory of the VisDA17 dataset (default: %(default)s)",
     )
     parser.add_argument(
@@ -61,6 +58,19 @@ def parse_args():
         default=5e-4,
         help="Weight decay (default: %(default)s)",
     )
+
+    parser.add_argument(
+        "--task",
+        default="classification",
+        choices=["classification", "segmentation"],
+        help="Task to run (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--encoder",
+        default="resnet101",
+        choices=["resnet101", "deeplab50", "deeplab101"],
+        help="Backbone network to use (default: %(default)s)",
+    )
     parser.add_argument(
         "--momentum",
         type=float,
@@ -73,25 +83,7 @@ def parse_args():
         default=12,
         help="Number of classes (default: %(default)s)",
     )
-    parser.add_argument(
-        "--emb-dim",
-        type=int,
-        default=128,
-        help="Feature dimension (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--single-network",
-        dest="siamese",
-        action="store_false",
-        default=True,
-        help="Train with single network, for comparison",
-    )
-    parser.add_argument(
-        "--nce-weight",
-        type=float,
-        default=0.1,
-        help="Weight of nce loss (default: %(default)s)",
-    )
+
     parser.add_argument(
         "--eval-only",
         action="store_true",
@@ -99,10 +91,9 @@ def parse_args():
         help="Do not train, evaluate model",
     )
     parser.add_argument(
-        "--num-gpus",
-        type=int,
-        default=gpus_in_machine,
-        help="Number of gpus to use (default: All GPUs in the machine)",
+        "--gpus",
+        default=-1,
+        help="GPUs to use (default: All GPUs in the machine)",
     )
     parser.add_argument(
         "--resume", default=None, help="Resume from the given checkpoint"
@@ -124,20 +115,120 @@ def parse_args():
         help="Augmentations to use (default: %(default)s)",
     )
     parser.add_argument(
-        "--seed", type=int, default=0, help="Random seed (default: %(default)s)"
+        "--seed", default="random", help="Random seed (default: %(default)s)"
     )
+    parser.add_argument(
+        "--fc-dim",
+        type=int,
+        default=512,
+        help="Dimension of FC hidden layer (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--no-apool",
+        dest="apool",
+        action="store_const",
+        default=True,
+        const=False,
+        help="Disable attentional pooling",
+    )
+
+    parser.add_argument(
+        "--single-network",
+        dest="siamese",
+        action="store_false",
+        default=True,
+        help="Train with single network, for comparison",
+    )
+    parser.add_argument(
+        "--stages",
+        default=(3, 4),
+        nargs="+",
+        help="Feature stages to use in contrastive loss calculation",
+    )
+    parser.add_argument(
+        "--emb-dim",
+        type=int,
+        default=128,
+        help="Feature dimension (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--emb-depth",
+        type=int,
+        default=1,
+        help="Depth of project layers (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--num-patches",
+        type=int,
+        default=1,
+        help="Crop feature maps to NxN patches, for dense contrastive loss caculation (default: %(default)s)",
+    )
+
+    parser.add_argument(
+        "--moco-weight",
+        type=float,
+        default=0.1,
+        help="Weight of MoCo loss (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--moco-queue-size",
+        type=int,
+        default=2 ** 16,
+        help="Queue size of MoCo (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--moco-momentum",
+        type=float,
+        default=0.999,
+        help="Encoder momentum of MoCo (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--moco-temperature",
+        type=float,
+        default=0.07,
+        help="Temperature of MoCo (default: %(default)s)",
+    )
+
     return parser.parse_args()
+
+
+def build_loss(hparams):
+    return ssl_loss.MoCoLoss(
+        embedding_dim=hparams.emb_dim,
+        queue_size=hparams.moco_queue_size,
+        momentum=hparams.moco_momentum,
+        temperature=hparams.moco_temperature,
+        scale_loss=hparams.moco_weight,
+        queue_ids=hparams.stages,
+    )
 
 
 def main():
     args = parse_args()
     print("Args: ", args)
 
-    pl.seed_everything(args.seed)
+    seed = random.randint(0, 1e7) if args.seed == "random" else int(args.seed)
+    pl.seed_everything(seed)
 
-    encoder = resnet101
+    encoder = {
+        "resnet101": resnet101,
+        "deeplab50": deeplab50,
+        "deeplab101": deeplab101,
+    }[args.encoder]
+    task = args.task.lower()
 
-    model = SiameseNet(
+    if task == "classification":
+        _model = SiameseNet
+        _datamodule = VISDA17DataModule
+        monitor = "val_acc1"
+    elif task == "segmentation":
+        _model = SiameseNetSegmentation
+        _datamodule = GTA5toCityscapesDataModule
+        monitor = "val_iou"
+    else:
+        raise KeyError(f"Unknown task: {task}")
+
+    model = _model(
         base_encoder=encoder,
         num_classes=args.num_classes,
         batch_size=args.batch_size,
@@ -145,16 +236,17 @@ def main():
         momentum=args.momentum,
         weight_decay=args.weight_decay,
         siamese=args.siamese,
-        labmda_nce=args.nce_weight,
-        stages=(3, 4),
+        stages=args.stages,
         emb_dim=args.emb_dim,
-        num_negatives=2 ** 16,
-        encoder_momentum=0.999,
-        softmax_temperature=0.07,
+        emb_depth=args.emb_depth,
+        fc_dim=args.fc_dim,
+        apool=args.apool,
+        num_patches=args.num_patches,
+        contrastive_loss=build_loss(args),
     )
 
-    datamodule = VISDA17DataModule(
-        data_dir=args.root,
+    datamodule = _datamodule(
+        root_dir=args.root,
         batch_size=args.batch_size,
         transforms=args.augmentation,
     )
@@ -170,7 +262,7 @@ def main():
         default_hp_metric=False,
     )
     checkpoint_monitor = ModelCheckpoint(
-        monitor="val_acc1",
+        monitor=monitor,
         mode="max",
         dirpath=os.path.join(args.output, "tensorboard", exp_name + start_time),
         filename=exp_name + "_{epoch:02d}_{val_loss:.2f}_{val_acc1:.2f}",
@@ -178,9 +270,10 @@ def main():
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
 
     trainer = pl.Trainer(
-        gpus=args.num_gpus,
+        gpus=args.gpus,
         max_epochs=args.epochs,
         check_val_every_n_epoch=1,
+        accelerator="ddp",
         logger=logger,
         callbacks=[
             lr_monitor,
@@ -188,6 +281,9 @@ def main():
         ],
         resume_from_checkpoint=args.resume,
         fast_dev_run=args.dev_run,
+        plugins=[
+            DDPPlugin(find_unused_parameters=True),
+        ],
     )
 
     if args.eval_only:
@@ -195,7 +291,9 @@ def main():
             print("You must specify --resume <checkpoint>")
             exit(1)
 
-        model = SiameseNet.load_from_checkpoint(args.resume)
+        model = _model.load_from_checkpoint(
+            args.resume, contrastive_loss=build_loss(args)
+        )
         datamodule.setup(stage="val")
         trainer.validate(model, val_dataloaders=datamodule.val_dataloader())
     else:
